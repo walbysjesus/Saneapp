@@ -1,0 +1,1099 @@
+const { onDocumentCreated, onDocumentUpdated } = require('firebase-functions/v2/firestore');
+const { onRequest } = require('firebase-functions/v2/https');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
+const logger = require('firebase-functions/logger');
+const admin = require('firebase-admin');
+const crypto = require('crypto');
+
+// LAZY LOAD: Requiring these modules later to avoid initialization timeout
+let runCategoryConsistencyAudit = null;
+let validateCategoriesCatalogConsistency = null;
+
+function loadCatalogModules() {
+  if (!runCategoryConsistencyAudit) {
+    ({runCategoryConsistencyAudit} = require('./audit_category_catalog_consistency'));
+  }
+  if (!validateCategoriesCatalogConsistency) {
+    ({validateCategoriesCatalogConsistency} = require('./validate_category_catalog'));
+  }
+}
+
+admin.initializeApp();
+let firestoreInstance = null;
+
+const OPEN_ASSIGNMENT_STATUSES = ['asignado', 'verificado', 'en_acompanamiento'];
+const MAX_OPEN_ASSIGNMENTS_PER_SUPERVISOR = 5;
+const NEARBY_CITY_MAP = {
+  bogota: ['soacha', 'chia', 'cajica', 'mosquera', 'funza', 'madrid'],
+  medellin: ['bello', 'itagui', 'envigado', 'sabaneta', 'copacabana', 'la estrella'],
+  cali: ['yumbo', 'jamundi', 'palmira', 'candelaria'],
+  barranquilla: ['soledad', 'malambo', 'puerto colombia'],
+  cartagena: ['turbaco', 'arjona', 'turbana'],
+  bucaramanga: ['floridablanca', 'giron', 'piedecuesta'],
+  cucuta: ['villa del rosario', 'los patios'],
+  pereira: ['dosquebradas', 'la virginia', 'armenia', 'manizales'],
+  manizales: ['villamaria', 'pereira', 'chinchina'],
+  armenia: ['calarca', 'pereira'],
+};
+
+const PAYMENT_ALLOWED_METHODS = new Set(['mercadoPago', 'payu']);
+const PAYMENT_CURRENCY = 'COP';
+const PAYMENT_WEBHOOK_SECRET = process.env.PAYMENT_WEBHOOK_SECRET || '';
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
+const MP_SUCCESS_URL = process.env.MP_SUCCESS_URL || 'https://saneapp.co/payments/success';
+const MP_PENDING_URL = process.env.MP_PENDING_URL || 'https://saneapp.co/payments/pending';
+const MP_FAILURE_URL = process.env.MP_FAILURE_URL || 'https://saneapp.co/payments/failure';
+const MP_WEBHOOK_URL = process.env.MP_WEBHOOK_URL || '';
+
+const PAYU_MERCHANT_ID = process.env.PAYU_MERCHANT_ID || '';
+const PAYU_ACCOUNT_ID = process.env.PAYU_ACCOUNT_ID || '';
+const PAYU_API_KEY = process.env.PAYU_API_KEY || '';
+const PAYU_TEST = String(process.env.PAYU_TEST || '1');
+const PAYU_RESPONSE_URL = process.env.PAYU_RESPONSE_URL || 'https://saneapp.co/payments/success';
+const PAYU_CONFIRMATION_URL = process.env.PAYU_CONFIRMATION_URL || '';
+const COMMERCIAL_SLA_RESPONSE_HOURS = 24;
+
+exports.initializeCommercialSlaOnRequestCreate = onDocumentCreated(
+  'solicitudes/{solicitudId}',
+  async (event) => {
+    const snapshot = event.data;
+    if (!snapshot) {
+      return;
+    }
+
+    const data = snapshot.data() || {};
+    if (!shouldTrackCommercialSla(data)) {
+      return;
+    }
+
+    const createdAt = resolveTimestampToDate(data.createdAt) || new Date();
+    const deadline = new Date(
+      createdAt.getTime() + COMMERCIAL_SLA_RESPONSE_HOURS * 60 * 60 * 1000,
+    );
+
+    await snapshot.ref.set(
+      {
+        providerResponseDeadlineAt:
+          admin.firestore.Timestamp.fromDate(deadline),
+        slaStatus: 'waiting_provider_response',
+        commercialFlowUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        statusHistory: admin.firestore.FieldValue.arrayUnion({
+          event: 'sla_initialized',
+          source: 'functions.initializeCommercialSlaOnRequestCreate',
+          at: new Date().toISOString(),
+          deadlineAt: deadline.toISOString(),
+        }),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  },
+);
+
+exports.handleOfferCommercialAutomation = onDocumentCreated(
+  'ofertas/{ofertaId}',
+  async (event) => {
+    const snapshot = event.data;
+    if (!snapshot) {
+      return;
+    }
+
+    const offerData = snapshot.data() || {};
+    const solicitudId = String(offerData.solicitudId || '').trim();
+    if (!solicitudId) {
+      return;
+    }
+
+    const db = getDb();
+    const requestRef = db.collection('solicitudes').doc(solicitudId);
+    const requestSnap = await requestRef.get();
+    if (!requestSnap.exists) {
+      return;
+    }
+
+    const requestData = requestSnap.data() || {};
+    const now = new Date();
+    const updates = {
+      offersCount: admin.firestore.FieldValue.increment(1),
+      lastOfferAt: admin.firestore.FieldValue.serverTimestamp(),
+      commercialFlowUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      statusHistory: admin.firestore.FieldValue.arrayUnion({
+        event: 'offer_received',
+        source: 'functions.handleOfferCommercialAutomation',
+        offerId: snapshot.id,
+        at: now.toISOString(),
+      }),
+    };
+
+    if (!requestData.firstOfferAt) {
+      updates.firstOfferAt = admin.firestore.FieldValue.serverTimestamp();
+    }
+
+    const currentStage = String(requestData.commercialFlowStage || '');
+    if (
+      currentStage === 'awaiting_provider_response' ||
+      currentStage === 'awaiting_provider_quote' ||
+      currentStage === 'open_marketplace'
+    ) {
+      updates.commercialFlowStage = 'offer_received';
+    }
+
+    if (String(requestData.slaStatus || '') === 'waiting_provider_response') {
+      const deadline = resolveTimestampToDate(requestData.providerResponseDeadlineAt);
+      if (deadline && now.getTime() <= deadline.getTime()) {
+        updates.slaStatus = 'provider_responded_in_time';
+      } else {
+        updates.slaStatus = 'provider_responded_late';
+        updates.slaBreachedAt = admin.firestore.FieldValue.serverTimestamp();
+      }
+    }
+
+    await requestRef.set(updates, { merge: true });
+
+    const generatorId = resolveGeneratorId(requestData);
+    if (generatorId) {
+      await upsertNotification({
+        userId: generatorId,
+        requestId: solicitudId,
+        key: 'offer_received',
+        title: 'Nueva oferta recibida',
+        message: 'Tu solicitud recibió una nueva oferta comercial.',
+        metadata: {
+          offerId: snapshot.id,
+          solicitudId,
+          providerId: offerData.proveedorId || null,
+        },
+      });
+    }
+  },
+);
+
+exports.enforceCommercialSlaBreaches = onSchedule(
+  {
+    schedule: 'every 30 minutes',
+    timeZone: 'America/Bogota',
+  },
+  async () => {
+    const db = getDb();
+    const nowTs = admin.firestore.Timestamp.now();
+
+    const snapshot = await db
+      .collection('solicitudes')
+      .where('slaStatus', '==', 'waiting_provider_response')
+      .where('providerResponseDeadlineAt', '<=', nowTs)
+      .limit(200)
+      .get();
+
+    if (snapshot.empty) {
+      return;
+    }
+
+    const batch = db.batch();
+    const notifications = [];
+    for (const doc of snapshot.docs) {
+      const data = doc.data() || {};
+      if (!isCommercialRequestOpen(data)) {
+        continue;
+      }
+
+      const deadline = resolveTimestampToDate(data.providerResponseDeadlineAt);
+      const overdueHours = deadline
+        ? Math.max(1, Math.floor((Date.now() - deadline.getTime()) / (60 * 60 * 1000)))
+        : null;
+
+      batch.set(
+        doc.ref,
+        {
+          slaStatus: 'provider_response_overdue',
+          commercialFlowStage: 'provider_response_overdue',
+          slaBreachedAt: admin.firestore.FieldValue.serverTimestamp(),
+          slaOverdueHours: overdueHours,
+          commercialFlowUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          statusHistory: admin.firestore.FieldValue.arrayUnion({
+            event: 'sla_breached',
+            source: 'functions.enforceCommercialSlaBreaches',
+            at: new Date().toISOString(),
+            overdueHours,
+          }),
+        },
+        { merge: true },
+      );
+
+      const generatorId = resolveGeneratorId(data);
+      if (generatorId) {
+        notifications.push(
+          upsertNotification({
+            userId: generatorId,
+            requestId: doc.id,
+            key: 'sla_overdue',
+            title: 'SLA comercial vencido',
+            message:
+              'Tu solicitud no recibió respuesta comercial dentro del SLA. SaneApp la priorizará automáticamente.',
+            metadata: {
+              solicitudId: doc.id,
+              overdueHours,
+            },
+          }),
+        );
+      }
+    }
+
+    await batch.commit();
+    await Promise.all(notifications);
+  },
+);
+
+exports.weeklyCategoryCatalogAudit = onSchedule(
+  {
+    schedule: 'every monday 06:00',
+    timeZone: 'America/Bogota',
+  },
+  async () => {
+    loadCatalogModules();
+    const summary = await runCategoryConsistencyAudit({
+      projectId: process.env.FIREBASE_PROJECT_ID || process.env.GCLOUD_PROJECT || 'saneapp-clean',
+      sampleLimit: 50,
+      writeFirestoreReport: true,
+      reportCollection: 'operational_audits',
+    });
+
+    if (summary.totals.unresolved > 0) {
+      logger.error('weeklyCategoryCatalogAudit detected unresolved catalog documents', {
+        unresolved: summary.totals.unresolved,
+        inspected: summary.totals.inspected,
+        reportPath: summary.firestoreReportPath || null,
+      });
+      return;
+    }
+
+    logger.info('weeklyCategoryCatalogAudit completed clean', {
+      inspected: summary.totals.inspected,
+      clean: summary.totals.clean,
+      reportPath: summary.firestoreReportPath || null,
+    });
+  },
+);
+
+exports.createGatewayPaymentSession = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'method_not_allowed' });
+    return;
+  }
+
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : '';
+    if (!token) {
+      res.status(401).json({ error: 'missing_auth_token' });
+      return;
+    }
+
+    const decoded = await admin.auth().verifyIdToken(token);
+    const uid = decoded.uid;
+
+    const {
+      paymentId,
+      requestId,
+      method,
+      amount,
+      currency,
+      description,
+    } = req.body || {};
+
+    if (!paymentId || !requestId || !method || !amount || !currency) {
+      res.status(400).json({ error: 'missing_required_fields' });
+      return;
+    }
+    if (!PAYMENT_ALLOWED_METHODS.has(String(method))) {
+      res.status(400).json({ error: 'unsupported_payment_method' });
+      return;
+    }
+    if (String(currency) !== PAYMENT_CURRENCY) {
+      res.status(400).json({ error: 'unsupported_currency' });
+      return;
+    }
+    if (Number(amount) <= 0) {
+      res.status(400).json({ error: 'invalid_amount' });
+      return;
+    }
+
+    const db = getDb();
+    const paymentRef = db.collection('payments').doc(String(paymentId));
+    const requestRef = db.collection('solicitudes').doc(String(requestId));
+
+    const paymentSnap = await paymentRef.get();
+    if (!paymentSnap.exists) {
+      res.status(404).json({ error: 'payment_not_found' });
+      return;
+    }
+    const paymentData = paymentSnap.data() || {};
+    if (paymentData.generadorId !== uid && paymentData.userId !== uid) {
+      res.status(403).json({ error: 'forbidden_payment_owner' });
+      return;
+    }
+    const existingCheckoutUrl = String(paymentData.gatewayCheckoutUrl || '').trim();
+    const existingSessionId = String(paymentData.gatewaySessionId || '').trim();
+    const existingStatus = String(paymentData.paymentStatus || '').toLowerCase();
+    if (existingCheckoutUrl && existingSessionId && existingStatus === 'pendiente_confirmacion_gateway') {
+      res.status(200).json({
+        ok: true,
+        sessionId: existingSessionId,
+        gatewayReference: String(paymentData.gatewayReference || ''),
+        checkoutUrl: existingCheckoutUrl,
+        reused: true,
+      });
+      return;
+    }
+
+    const gatewayReference = `gw_${String(paymentId)}_${Date.now()}`;
+    const gatewaySession = await createGatewayCheckoutSession({
+      method: String(method),
+      paymentId: String(paymentId),
+      requestId: String(requestId),
+      amount: Number(amount),
+      currency: String(currency),
+      description: String(description || 'Pago premium SaneApp'),
+      buyerEmail: String(decoded.email || ''),
+      gatewayReference,
+    });
+
+    await db.runTransaction(async (tx) => {
+      tx.set(paymentRef, {
+        gatewaySessionId: gatewaySession.sessionId,
+        gatewayReference: gatewaySession.gatewayReference,
+        gatewayMethod: method,
+        gatewayStatus: 'checkout_ready',
+        gatewayAmount: Number(amount),
+        gatewayCurrency: String(currency),
+        gatewayDescription: String(description || ''),
+        gatewayCheckoutUrl: gatewaySession.checkoutUrl,
+        gatewayProviderPayload: gatewaySession.providerPayload,
+        paymentStatus: 'pendiente_confirmacion_gateway',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      tx.set(requestRef, {
+        paymentStatus: 'pendiente_confirmacion_gateway',
+        paymentCheckoutUrl: gatewaySession.checkoutUrl,
+        commercialFlowStage: 'payment_gateway_pending',
+        commercialFlowUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+
+    res.status(200).json({
+      ok: true,
+      sessionId: gatewaySession.sessionId,
+      gatewayReference: gatewaySession.gatewayReference,
+      checkoutUrl: gatewaySession.checkoutUrl,
+    });
+  } catch (error) {
+    logger.error('createGatewayPaymentSession error', error);
+    res.status(500).json({
+      error: 'internal_error',
+      message: error.message || String(error),
+    });
+  }
+});
+
+exports.paymentGatewayWebhook = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'method_not_allowed' });
+    return;
+  }
+
+  try {
+    if (!verifyWebhookSignature(req)) {
+      res.status(401).json({ error: 'invalid_signature' });
+      return;
+    }
+
+    const {
+      eventId,
+      paymentId,
+      gatewaySessionId,
+      gatewayReference,
+      status,
+      raw,
+    } = req.body || {};
+
+    if (!eventId || !paymentId || !status) {
+      res.status(400).json({ error: 'missing_required_fields' });
+      return;
+    }
+
+    const normalizedStatus = normalizeGatewayStatus(String(status));
+    if (!normalizedStatus) {
+      res.status(400).json({ error: 'unsupported_status' });
+      return;
+    }
+
+    const db = getDb();
+    const eventRef = db.collection('payment_webhook_events').doc(String(eventId));
+    const paymentRef = db.collection('payments').doc(String(paymentId));
+    const requestRef = db.collection('solicitudes').doc(String(paymentId));
+
+    await db.runTransaction(async (tx) => {
+      const eventSnap = await tx.get(eventRef);
+      if (eventSnap.exists) {
+        return;
+      }
+
+      const paymentSnap = await tx.get(paymentRef);
+      if (!paymentSnap.exists) {
+        throw new Error('payment_not_found');
+      }
+
+      const paymentData = paymentSnap.data() || {};
+      const currentStatus = String(paymentData.paymentStatus || '').toLowerCase();
+      const targetStatus = mapGatewayToPaymentStatus(normalizedStatus);
+
+      if (currentStatus === 'liberado' && targetStatus !== 'liberado') {
+        tx.set(eventRef, {
+          eventId,
+          paymentId,
+          status: normalizedStatus,
+          ignored: true,
+          reason: 'payment_already_released',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+        return;
+      }
+
+      tx.set(paymentRef, {
+        gatewayStatus: normalizedStatus,
+        paymentStatus: targetStatus,
+        gatewaySessionId: gatewaySessionId || paymentData.gatewaySessionId || null,
+        gatewayReference: gatewayReference || paymentData.gatewayReference || null,
+        gatewayLastEventId: eventId,
+        gatewayRaw: raw || req.body,
+        statusHistory: admin.firestore.FieldValue.arrayUnion({
+          status: targetStatus,
+          gatewayStatus: normalizedStatus,
+          source: 'gateway_webhook',
+          eventId,
+          at: new Date().toISOString(),
+        }),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      tx.set(requestRef, {
+        paymentStatus: targetStatus,
+        status: targetStatus === 'en_custodia' ? 'pago_confirmado' : 'pago_rechazado',
+        commercialFlowStage: targetStatus === 'en_custodia'
+          ? 'payment_in_escrow'
+          : 'payment_gateway_failed',
+        commercialFlowUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      tx.set(eventRef, {
+        eventId,
+        paymentId,
+        status: normalizedStatus,
+        paymentStatus: targetStatus,
+        gatewaySessionId: gatewaySessionId || null,
+        gatewayReference: gatewayReference || null,
+        payload: req.body,
+        processed: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    logger.error('paymentGatewayWebhook error', error);
+    res.status(500).json({
+      error: 'internal_error',
+      message: error.message || String(error),
+    });
+  }
+});
+
+async function createGatewayCheckoutSession({
+  method,
+  paymentId,
+  requestId,
+  amount,
+  currency,
+  description,
+  buyerEmail,
+  gatewayReference,
+}) {
+  if (method === 'mercadoPago') {
+    return createMercadoPagoSession({
+      paymentId,
+      requestId,
+      amount,
+      currency,
+      description,
+      buyerEmail,
+      gatewayReference,
+    });
+  }
+  if (method === 'payu') {
+    return createPayUSession({
+      paymentId,
+      amount,
+      currency,
+      description,
+      buyerEmail,
+      gatewayReference,
+    });
+  }
+  throw new Error('unsupported_method');
+}
+
+async function createMercadoPagoSession({
+  paymentId,
+  requestId,
+  amount,
+  currency,
+  description,
+  buyerEmail,
+  gatewayReference,
+}) {
+  if (!MP_ACCESS_TOKEN) {
+    throw new Error('missing_mp_access_token');
+  }
+
+  const body = {
+    external_reference: gatewayReference,
+    notification_url: MP_WEBHOOK_URL || undefined,
+    back_urls: {
+      success: MP_SUCCESS_URL,
+      pending: MP_PENDING_URL,
+      failure: MP_FAILURE_URL,
+    },
+    auto_return: 'approved',
+    payer: buyerEmail ? { email: buyerEmail } : undefined,
+    metadata: {
+      paymentId,
+      requestId,
+      source: 'saneapp',
+    },
+    items: [
+      {
+        id: paymentId,
+        title: description,
+        quantity: 1,
+        currency_id: currency,
+        unit_price: amount,
+      },
+    ],
+  };
+
+  const response = await fetch('https://api.mercadopago.com/checkout/preferences', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`mercadopago_preference_failed:${response.status}:${text}`);
+  }
+
+  const payload = await response.json();
+  const sessionId = String(payload.id || '').trim();
+  const checkoutUrl = String(payload.init_point || payload.sandbox_init_point || '').trim();
+  if (!sessionId || !checkoutUrl) {
+    throw new Error('mercadopago_invalid_preference_response');
+  }
+
+  return {
+    sessionId,
+    gatewayReference,
+    checkoutUrl,
+    providerPayload: payload,
+  };
+}
+
+function createPayUSession({
+  paymentId,
+  amount,
+  currency,
+  description,
+  buyerEmail,
+  gatewayReference,
+}) {
+  if (!PAYU_MERCHANT_ID || !PAYU_ACCOUNT_ID || !PAYU_API_KEY) {
+    throw new Error('missing_payu_credentials');
+  }
+
+  const amountFormatted = Number(amount).toFixed(2);
+  const signatureRaw = `${PAYU_API_KEY}~${PAYU_MERCHANT_ID}~${gatewayReference}~${amountFormatted}~${currency}`;
+  const signature = crypto.createHash('md5').update(signatureRaw).digest('hex');
+
+  const params = new URLSearchParams({
+    merchantId: PAYU_MERCHANT_ID,
+    accountId: PAYU_ACCOUNT_ID,
+    description,
+    referenceCode: gatewayReference,
+    amount: amountFormatted,
+    tax: '0',
+    taxReturnBase: '0',
+    currency,
+    signature,
+    test: PAYU_TEST,
+    responseUrl: PAYU_RESPONSE_URL,
+    confirmationUrl: PAYU_CONFIRMATION_URL,
+    buyerEmail: buyerEmail || '',
+    extra1: paymentId,
+  });
+
+  const checkoutUrl = `https://checkout.payulatam.com/ppp-web-gateway-payu/?${params.toString()}`;
+  return {
+    sessionId: gatewayReference,
+    gatewayReference,
+    checkoutUrl,
+    providerPayload: {
+      method: 'payu',
+      signature,
+      referenceCode: gatewayReference,
+    },
+  };
+}
+
+function verifyWebhookSignature(req) {
+  if (!PAYMENT_WEBHOOK_SECRET) {
+    logger.warn('PAYMENT_WEBHOOK_SECRET no configurado; webhook no puede validarse.');
+    return false;
+  }
+  const signatureHeader = req.headers['x-payment-signature'];
+  if (!signatureHeader || typeof signatureHeader !== 'string') {
+    return false;
+  }
+  const payload = req.rawBody
+    ? Buffer.from(req.rawBody)
+    : Buffer.from(JSON.stringify(req.body || {}));
+  const expected = crypto
+    .createHmac('sha256', PAYMENT_WEBHOOK_SECRET)
+    .update(payload)
+    .digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(expected));
+}
+
+function normalizeGatewayStatus(status) {
+  const normalized = status.trim().toLowerCase();
+  if (['approved', 'authorized', 'captured', 'paid'].includes(normalized)) {
+    return 'approved';
+  }
+  if (['rejected', 'declined', 'failed', 'cancelled', 'canceled', 'expired'].includes(normalized)) {
+    return 'rejected';
+  }
+  return '';
+}
+
+function mapGatewayToPaymentStatus(gatewayStatus) {
+  if (gatewayStatus === 'approved') {
+    return 'en_custodia';
+  }
+  return 'rechazado_gateway';
+}
+
+function shouldTrackCommercialSla(requestData) {
+  const stage = String(requestData.commercialFlowStage || '');
+  return (
+    !requestData.providerResponseDeadlineAt &&
+    (stage === 'awaiting_provider_response' ||
+      stage === 'awaiting_provider_quote' ||
+      stage === 'open_marketplace')
+  );
+}
+
+function resolveGeneratorId(requestData) {
+  const candidate =
+    requestData.generadorId || requestData.clientId || requestData.userId;
+  const value = String(candidate || '').trim();
+  return value || null;
+}
+
+function resolveTimestampToDate(value) {
+  if (!value) {
+    return null;
+  }
+  if (value instanceof admin.firestore.Timestamp) {
+    return value.toDate();
+  }
+  if (value instanceof Date) {
+    return value;
+  }
+  if (typeof value.toDate === 'function') {
+    return value.toDate();
+  }
+  return null;
+}
+
+function isCommercialRequestOpen(requestData) {
+  const status = String(requestData.status || '').toLowerCase();
+  if (['cancelada', 'rechazada', 'completada', 'finalizada'].includes(status)) {
+    return false;
+  }
+  if (requestData.selectedProveedorId || requestData.selectedOfferId) {
+    return false;
+  }
+  return true;
+}
+
+async function upsertNotification({
+  userId,
+  requestId,
+  key,
+  title,
+  message,
+  metadata = {},
+}) {
+  const db = getDb();
+  const safeKey = String(key || 'event').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeRequest = String(requestId || 'request').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeUser = String(userId || 'user').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const id = `${safeUser}_${safeRequest}_${safeKey}`.substring(0, 120);
+
+  await db.collection('notifications').doc(id).set(
+    {
+      userId,
+      title,
+      message,
+      type: key,
+      requestId,
+      metadata,
+      read: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+}
+
+exports.autoAssignSupervisorOnCreate = onDocumentCreated(
+  'solicitudes/{solicitudId}',
+  async (event) => {
+    const snapshot = event.data;
+    if (!snapshot) {
+      return;
+    }
+    await attemptAutoDispatch(snapshot.ref, snapshot.data(), 'create');
+  },
+);
+
+exports.autoAssignSupervisorOnRequest = onDocumentUpdated(
+  'solicitudes/{solicitudId}',
+  async (event) => {
+    const before = event.data.before.data();
+    const after = event.data.after.data();
+    if (!before || !after) {
+      return;
+    }
+
+    const requestedNow = before.supervisorRequested !== true && after.supervisorRequested === true;
+    const pendingAutoDispatchNow =
+      before.supervisorDispatchMode !== 'pending_auto_dispatch' &&
+      after.supervisorDispatchMode === 'pending_auto_dispatch';
+
+    if (!requestedNow && !pendingAutoDispatchNow) {
+      return;
+    }
+
+    await attemptAutoDispatch(event.data.after.ref, after, 'update');
+  },
+);
+
+async function attemptAutoDispatch(requestRef, requestData, triggerSource) {
+  if (!shouldDispatch(requestData)) {
+    return;
+  }
+
+  const db = getDb();
+
+  const city = normalizeCity(requestData.city);
+  if (!city) {
+    await requestRef.set(
+      {
+        supervisorDispatchMode: 'manual_queue',
+        supervisorDispatchReason: 'No se encontró una ciudad válida para la autoasignación.',
+        supervisorDispatchAttemptedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return;
+  }
+
+  const activeSupervisorsSnapshot = await db
+    .collection('users')
+    .where('role', '==', 'supervisor')
+    .where('status', '==', 'active')
+    .get();
+
+  const supervisors = activeSupervisorsSnapshot.docs
+    .map((doc) => ({ id: doc.id, ...doc.data() }))
+    .filter((data) => data.supervisorProfileCompleted === true);
+
+  const cityScope = resolveDispatchCities(city);
+  const sameCityCandidates = supervisors.filter(
+    (supervisor) => normalizeCity(supervisor.city) === city,
+  );
+  const nearbyCandidates = supervisors.filter((supervisor) => {
+    const supervisorCity = normalizeCity(supervisor.city);
+    return supervisorCity && supervisorCity !== city && cityScope.includes(supervisorCity);
+  });
+
+  const sameCityLoads = await buildCandidatesWithLoad(sameCityCandidates, { cityPriority: 0 });
+  const nearbyLoads = await buildCandidatesWithLoad(nearbyCandidates, { cityPriority: 1 });
+
+  const sameCityAvailable = sameCityLoads.filter((candidate) => candidate.openAssignments < MAX_OPEN_ASSIGNMENTS_PER_SUPERVISOR);
+  const nearbyAvailable = nearbyLoads.filter((candidate) => candidate.openAssignments < MAX_OPEN_ASSIGNMENTS_PER_SUPERVISOR);
+
+  const selectedCandidate = sortCandidates([...sameCityAvailable, ...nearbyAvailable])[0] ?? null;
+
+  const latestSnapshot = await requestRef.get();
+  const latestData = latestSnapshot.data();
+  if (!latestData || !shouldDispatch(latestData)) {
+    return;
+  }
+
+  if (selectedCandidate == null) {
+    await requestRef.set(
+      {
+        supervisorDispatchMode: 'manual_queue',
+        supervisorDispatchReason: buildQueueReason({
+          sameCityCount: sameCityCandidates.length,
+          nearbyCount: nearbyCandidates.length,
+        }),
+        supervisorDispatchAttemptedAt: admin.firestore.FieldValue.serverTimestamp(),
+        supervisorDispatchTrigger: triggerSource,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    logger.info('Supervisor request queued for manual assignment', {
+      requestId: requestRef.id,
+      city,
+      triggerSource,
+    });
+    return;
+  }
+
+  const assignmentMode = selectedCandidate.cityPriority == 0
+    ? 'auto_same_city'
+    : 'auto_nearby_city';
+  const orderCode = buildSupervisorOrderCode(requestRef.id, city);
+
+  await requestRef.set(
+    {
+      supervisorOrderCode: requestData.supervisorOrderCode || orderCode,
+      supervisorId: selectedCandidate.id,
+      supervisorName: selectedCandidate.name,
+      supervisorAssignedAt: admin.firestore.FieldValue.serverTimestamp(),
+      supervisorStatus: 'asignado',
+      supervisorDispatchMode: assignmentMode,
+      supervisorDispatchReason: assignmentMode == 'auto_same_city'
+        ? 'Asignado automáticamente al supervisor activo con menor carga en la misma ciudad.'
+        : 'Asignado automáticamente a una ciudad cercana por saturación o falta de cobertura local.',
+      supervisorDispatchAttemptedAt: admin.firestore.FieldValue.serverTimestamp(),
+      supervisorDispatchTrigger: triggerSource,
+      supervisorAssignedCity: selectedCandidate.city,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+
+  logger.info('Supervisor assigned automatically', {
+    requestId: requestRef.id,
+    supervisorId: selectedCandidate.id,
+    city,
+    assignmentMode,
+    openAssignments: selectedCandidate.openAssignments,
+  });
+}
+
+function shouldDispatch(requestData) {
+  return requestData.supervisorRequested === true &&
+    requestData.supervisorStatus === 'pendiente_asignacion' &&
+    !requestData.supervisorId;
+}
+
+async function buildCandidatesWithLoad(supervisors, { cityPriority }) {
+  const db = getDb();
+  return Promise.all(
+    supervisors.map(async (supervisor) => {
+      const openAssignmentsSnapshot = await db
+        .collection('solicitudes')
+        .where('supervisorId', '==', supervisor.id)
+        .where('supervisorStatus', 'in', OPEN_ASSIGNMENT_STATUSES)
+        .get();
+
+      const name = supervisor.fullName || supervisor.companyName || supervisor.email || supervisor.id;
+      return {
+        id: supervisor.id,
+        name,
+        city: supervisor.city || '',
+        openAssignments: openAssignmentsSnapshot.size,
+        cityPriority,
+      };
+    }),
+  );
+}
+
+function getDb() {
+  if (!firestoreInstance) {
+    firestoreInstance = admin.firestore();
+  }
+  return firestoreInstance;
+}
+
+function sortCandidates(candidates) {
+  return [...candidates].sort((left, right) => {
+    if (left.cityPriority != right.cityPriority) {
+      return left.cityPriority - right.cityPriority;
+    }
+    if (left.openAssignments != right.openAssignments) {
+      return left.openAssignments - right.openAssignments;
+    }
+    return left.name.localeCompare(right.name, 'es');
+  });
+}
+
+function resolveDispatchCities(city) {
+  return [city, ...(NEARBY_CITY_MAP[city] || [])];
+}
+
+function normalizeCity(value) {
+  if (!value || typeof value !== 'string') {
+    return '';
+  }
+  return value
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+
+function buildQueueReason({ sameCityCount, nearbyCount }) {
+  if (sameCityCount === 0 && nearbyCount === 0) {
+    return 'No hay supervisores activos y completos disponibles en la ciudad ni en ciudades cercanas.';
+  }
+  if (sameCityCount === 0) {
+    return 'No hay supervisores activos en la ciudad y las ciudades cercanas están saturadas o sin cupo operativo.';
+  }
+  return 'Los supervisores de la ciudad y ciudades cercanas alcanzaron el límite operativo; la solicitud queda en cola manual.';
+}
+
+function buildSupervisorOrderCode(requestId, city) {
+  const cityCode = (city || 'GEN')
+    .split(' ')
+    .filter(Boolean)
+    .map((part) => part.substring(0, 1).toUpperCase())
+    .join('')
+    .substring(0, 3)
+    .padEnd(3, 'X');
+  const date = new Date();
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  const suffix = requestId.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().substring(0, 6).padEnd(6, '0');
+  return `SUP-${cityCode}-${year}${month}${day}-${suffix}`;
+}
+
+exports.validateProviderCatalogOnWrite = onDocumentUpdated(
+  'providers/{providerId}',
+  async (event) => {
+    const before = event.data.before.data() || {};
+    const after = event.data.after.data() || {};
+
+    const categoriesBefore = before.selectedCategories || [];
+    const subcategoriesBefore = before.selectedSubcategories || [];
+    const categoriesAfter = after.selectedCategories || [];
+    const subcategoriesAfter = after.selectedSubcategories || [];
+
+    const hasCategoryChanges =
+      JSON.stringify(categoriesBefore) !== JSON.stringify(categoriesAfter) ||
+      JSON.stringify(subcategoriesBefore) !== JSON.stringify(subcategoriesAfter);
+
+    if (!hasCategoryChanges) {
+      return;
+    }
+
+    loadCatalogModules();
+    const db = getDb();
+    const { valid, errors } = await validateCategoriesCatalogConsistency(
+      db,
+      event.data.after.ref.path,
+      categoriesAfter,
+      subcategoriesAfter,
+    );
+
+    const criticalErrors = errors.filter((e) => e.severity === 'error');
+    if (!valid && criticalErrors.length > 0) {
+      logger.warn('validateProviderCatalogOnWrite: catalog inconsistency detected', {
+        providerId: event.data.after.id,
+        errors: criticalErrors,
+        categoriesAfter,
+        subcategoriesAfter,
+      });
+    }
+
+    const warningErrors = errors.filter((e) => e.severity === 'warning');
+    if (warningErrors.length > 0) {
+      logger.info('validateProviderCatalogOnWrite: catalog warnings', {
+        providerId: event.data.after.id,
+        warnings: warningErrors,
+      });
+    }
+  },
+);
+
+exports.validateUserCatalogOnWrite = onDocumentUpdated(
+  'users/{userId}',
+  async (event) => {
+    const before = event.data.before.data() || {};
+    const after = event.data.after.data() || {};
+
+    const categoriesBefore = before.selectedCategories || [];
+    const subcategoriesBefore = before.selectedSubcategories || [];
+    const categoriesAfter = after.selectedCategories || [];
+    const subcategoriesAfter = after.selectedSubcategories || [];
+
+    const hasCategoryChanges =
+      JSON.stringify(categoriesBefore) !== JSON.stringify(categoriesAfter) ||
+      JSON.stringify(subcategoriesBefore) !== JSON.stringify(subcategoriesAfter);
+
+    if (!hasCategoryChanges) {
+      return;
+    }
+loadCatalogModules();
+    
+    const db = getDb();
+    const { valid, errors } = await validateCategoriesCatalogConsistency(
+      db,
+      event.data.after.ref.path,
+      categoriesAfter,
+      subcategoriesAfter,
+    );
+
+    const criticalErrors = errors.filter((e) => e.severity === 'error');
+    if (!valid && criticalErrors.length > 0) {
+      logger.warn('validateUserCatalogOnWrite: catalog inconsistency detected', {
+        userId: event.data.after.id,
+        errors: criticalErrors,
+        categoriesAfter,
+        subcategoriesAfter,
+      });
+    }
+
+    const warningErrors = errors.filter((e) => e.severity === 'warning');
+    if (warningErrors.length > 0) {
+      logger.info('validateUserCatalogOnWrite: catalog warnings', {
+        userId: event.data.after.id,
+        warnings: warningErrors,
+      });
+    }
+  },
+);

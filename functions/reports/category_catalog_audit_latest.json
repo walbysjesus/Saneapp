@@ -1,0 +1,33 @@
+{
+  "mode": "audit-read-only",
+  "projectId": "saneapp-clean",
+  "generatedAt": "2026-07-03T03:03:58.840Z",
+  "catalog": {
+    "categories": 19,
+    "subcategories": 9
+  },
+  "totals": {
+    "scanned": 2,
+    "inspected": 1,
+    "clean": 1,
+    "legacy": 0,
+    "unresolved": 0
+  },
+  "collections": {
+    "providers": {
+      "scanned": 1,
+      "inspected": 1,
+      "clean": 1,
+      "legacy": 0,
+      "unresolved": 0
+    },
+    "users": {
+      "scanned": 1,
+      "inspected": 0,
+      "clean": 0,
+      "legacy": 0,
+      "unresolved": 0
+    }
+  },
+  "samples": []
+}

@@ -1,0 +1,130 @@
+platforms:
+  android:
+  ios:
+name: saneapp_pro_nuevo
+description: "SaneApp PRO - plataforma de servicios."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.4
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+  # The following adds the Cupertino Icons font to your application.
+  # Use with the CupertinoIcons class for iOS style icons.
+  cupertino_icons: ^1.0.8
+
+  # Firebase dependencies
+  firebase_core: ^3.0.0
+  firebase_auth: ^5.0.0
+  provider: ^6.1.1
+  cloud_firestore: ^5.0.0
+  firebase_messaging: ^15.2.10
+  firebase_app_check: ^0.3.2+10
+
+  # Para formateo de fechas y utilidades
+  intl: 0.20.2
+  # flutterfire_cli eliminado para optimización
+  firebase_analytics: ^11.6.0
+
+  # WebView para pagos
+  webview_flutter: ^4.0.7
+  mercadopago_sdk: ^1.3.0
+  url_launcher: ^6.3.2
+  geolocator: ^13.0.2
+  google_mlkit_text_recognition: ^0.15.1
+  payu_checkoutpro_flutter: ^1.4.0
+  image_picker: ^1.2.1
+  http: ^0.13.6
+  firebase_storage: ^12.0.0
+  file_selector: ^1.1.0
+  firebase_crashlytics: ^4.0.0
+  file_picker: ^10.3.10
+  path_provider: ^2.1.5
+  pdf: ^3.11.1
+  printing: ^5.14.0
+  google_sign_in: ^7.2.0
+  flutter_facebook_auth: ^6.0.4
+  facebook_auth_desktop:
+    path: third_party/facebook_auth_desktop
+  shared_preferences: ^2.5.4
+  share_plus: ^10.1.4
+  video_player: ^2.9.2
+  intl_utils: ^2.8.14
+  firebase_auth_mocks: ^0.14.2
+  multi_select_flutter: ^4.1.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  integration_test:
+    sdk: flutter
+
+  mockito: ^5.4.4
+  mocktail: ^1.0.3
+  fake_cloud_firestore: ^3.1.0
+
+  build_runner: ^2.4.8
+
+  # The "flutter_lints" package below contains a set of recommended lints to
+  # encourage good coding practices. The lint set provided by the package is
+  # activated in the `analysis_options.yaml` file located at the root of your
+  # package. See that file for information about deactivating specific lint
+  # rules and activating additional ones.
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+# Configuración para íconos de la app
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/images/logo_saneapp.png"
+
+# For information on the generic Dart part of this file, see the
+# following page: https://dart.dev/tools/pub/pubspec
+
+# The following section is specific to Flutter packages.
+flutter:
+
+  # The following line ensures that the Material Icons font is
+  # included with your application, so that you can use the icons in
+  # the material Icons class.
+  uses-material-design: true
+  generate: true
+
+  assets:
+    - assets/images/logo_saneapp.png
+    - assets/images/default_avatar.png
+    - assets/legal/terminos_condiciones.txt
+    - assets/legal/politica_privacidad.txt
+  # Solo se mantiene el logo realmente usado
+
+  # An image asset can refer to one or more resolution-specific "variants", see
+  # https://flutter.dev/to/resolution-aware-images
+
+  # For details regarding adding assets from package dependencies, see
+  # https://flutter.dev/to/asset-from-package
+
+  # To add custom fonts to your application, add a fonts section here,
+  # in this "flutter" section. Each entry in this list should have a
+  # "family" key with the font family name, and a "fonts" key with a
+  # list giving the asset and other descriptors for the font. For
+  # example:
+  # fonts:
+  #   - family: Schyler
+  #     fonts:
+  #       - asset: fonts/Schyler-Regular.ttf
+  #       - asset: fonts/Schyler-Italic.ttf
+  #         style: italic
+  #   - family: Trajan Pro
+  #     fonts:
+  #       - asset: fonts/TrajanPro.ttf
+  #       - asset: fonts/TrajanPro_Bold.ttf
+  #         weight: 700
+  #
+  # For details regarding fonts from package dependencies,
+  # see https://flutter.dev/to/font-from-package

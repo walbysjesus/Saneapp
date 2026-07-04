@@ -1,0 +1,80 @@
+const { onDocumentCreated, onDocumentUpdated } = require('firebase-functions/v2/firestore');
+const { onRequest } = require('firebase-functions/v2/https');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
+const logger = require('firebase-functions/logger');
+const admin = require('firebase-admin');
+
+admin.initializeApp();
+
+// TEST FUNCTION - Simple deploy test
+exports.helloWorld = onRequest({ cors: true }, (req, res) => {
+  logger.info('Hello world request received');
+  res.send('Hello from Cloud Functions!');
+});
+
+// Critical Function 1: SLA initialization (Block 3)
+exports.initializeCommercialSlaOnRequestCreate = onDocumentCreated(
+  'solicitudes/{solicitudId}',
+  async (event) => {
+    const snapshot = event.data;
+    if (!snapshot) {
+      return;
+    }
+    const data = snapshot.data() || {};
+    const serviceType = String(data.serviceType || '').toLowerCase();
+    if (serviceType !== 'comercial' && serviceType !== 'comercializacion') {
+      return;
+    }
+
+    const createdAt = (data.createdAt && data.createdAt.toDate)
+      ? data.createdAt.toDate()
+      : new Date();
+    const deadline = new Date(createdAt.getTime() + 24 * 60 * 60 * 1000);
+
+    await snapshot.ref.set(
+      {
+        providerResponseDeadlineAt: admin.firestore.Timestamp.fromDate(deadline),
+        slaStatus: 'waiting_provider_response',
+        commercialFlowUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        statusHistory: admin.firestore.FieldValue.arrayUnion({
+          event: 'sla_initialized',
+          source: 'functions.initializeCommercialSlaOnRequestCreate',
+          at: new Date().toISOString(),
+          deadlineAt: deadline.toISOString(),
+        }),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  },
+);
+
+// Critical Function 2: Payment webhook (Block 4)
+exports.handlePaymentWebhook = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'method_not_allowed' });
+    return;
+  }
+
+  try {
+    const { eventId, paymentId, status } = req.body || {};
+
+    if (!eventId || !paymentId || !status) {
+      res.status(400).json({ error: 'missing_required_fields' });
+      return;
+    }
+
+    logger.info('Payment webhook received', {
+      eventId,
+      paymentId,
+      status,
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Payment webhook error', { error: error.message });
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+logger.info('Cloud Functions initialized successfully');

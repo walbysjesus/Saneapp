@@ -1,0 +1,25 @@
+{
+  "name": "saneapp-backend-functions",
+  "private": true,
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "lint": "node -c index.js",
+    "serve": "firebase emulators:start --only functions",
+    "deploy": "firebase deploy --only functions",
+    "migrate:marketplace-schema:dry": "node migrate_marketplace_schema_v1.js --dry-run --project=saneapp-clean",
+    "migrate:marketplace-schema:apply": "node migrate_marketplace_schema_v1.js --apply --project=saneapp-clean",
+    "migrate:categories:dry": "node migrate_categories_legacy.js --dry-run --project=saneapp-clean",
+    "migrate:categories:apply": "node migrate_categories_legacy.js --apply --project=saneapp-clean",
+    "audit:categories:consistency": "node audit_category_catalog_consistency.js --project=saneapp-clean",
+    "audit:categories:gate": "node audit_category_catalog_consistency.js --project=saneapp-clean --fail-on-unresolved",
+    "audit:categories:export": "node audit_category_catalog_consistency.js --project=saneapp-clean --out=./reports/category_catalog_audit_latest.json"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^5.1.1"
+  }
+}

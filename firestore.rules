@@ -1,0 +1,330 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.admin == true ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+        )
+      );
+    }
+
+    function isSupervisor() {
+      return isSignedIn() && (
+        request.auth.token.supervisor == true ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'supervisor'
+        )
+      );
+    }
+
+    function isProvider() {
+      return isSignedIn() && (
+        request.auth.token.provider == true ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'proveedor'
+        )
+      );
+    }
+
+    function requestProviderOwns(resourceData) {
+      return isSignedIn() && (
+        resourceData.providerId == request.auth.uid ||
+        resourceData.proveedorId == request.auth.uid
+      );
+    }
+
+    function requestGeneratorOwns(resourceData) {
+      return isSignedIn() && (
+        resourceData.generadorId == request.auth.uid ||
+        resourceData.clientId == request.auth.uid ||
+        resourceData.userId == request.auth.uid
+      );
+    }
+
+    function requestVisibleToProvider(resourceData) {
+      return isProvider() && (
+        requestProviderOwns(resourceData) ||
+        resourceData.selectedProveedorId == request.auth.uid ||
+        resourceData.preferredProviderId == request.auth.uid ||
+        (
+          resourceData.status == 'activa' &&
+          resourceData.type == 'normal' &&
+          (
+            !('preferredProviderId' in resourceData) ||
+            resourceData.preferredProviderId == null ||
+            resourceData.preferredProviderId == '' ||
+            resourceData.preferredProviderId == request.auth.uid
+          )
+        ) ||
+        (
+          resourceData.status == 'activa' &&
+          resourceData.type == 'subasta'
+        )
+      );
+    }
+
+    function hasValidUserRole() {
+      return !('role' in request.resource.data) ||
+        request.resource.data.role in ['generador', 'proveedor', 'supervisor', 'admin'];
+    }
+
+    function hasValidUserStatus() {
+      return !('status' in request.resource.data) ||
+        request.resource.data.status in [
+          'pending_email',
+          'pending_documents',
+          'pending_review',
+          'prequalified',
+          'requires_review',
+          'active',
+          'suspended',
+          'rejected'
+        ];
+    }
+
+    function isSupervisorProfileSubmission(userId) {
+      return isOwner(userId) &&
+        resource.data.role == 'supervisor' &&
+        request.resource.data.role == 'supervisor' &&
+        request.resource.data.supervisorProfileCompleted == true &&
+        request.resource.data.status in ['prequalified', 'requires_review'];
+    }
+
+    function isSupervisorResubmission(userId) {
+      return isOwner(userId) &&
+        resource.data.role == 'supervisor' &&
+        resource.data.status == 'rejected' &&
+        request.resource.data.role == 'supervisor' &&
+        request.resource.data.status == 'pending_review';
+    }
+
+    function isProviderProfileSelfUpdate(userId) {
+      return isOwner(userId) &&
+        resource.data.role == 'proveedor' &&
+        request.resource.data.role == 'proveedor' &&
+        request.resource.data.status in ['pending_documents', 'pending_review'] &&
+        (
+          request.resource.data.status == resource.data.status ||
+          (
+            resource.data.status in [
+              'pending_email',
+              'pending_documents',
+              'pending_review',
+              'requires_review',
+              'rejected'
+            ] &&
+            request.resource.data.status in ['pending_documents', 'pending_review']
+          )
+        );
+    }
+
+    function validProviderDocumentWrite(docId) {
+      return request.resource.data.fieldKey == docId &&
+        request.resource.data.url is string &&
+        request.resource.data.url.size() > 10;
+    }
+
+    function immutablePaymentFields() {
+      return request.resource.data.monto == resource.data.monto &&
+        request.resource.data.currency == resource.data.currency &&
+        request.resource.data.generadorId == resource.data.generadorId &&
+        request.resource.data.proveedorId == resource.data.proveedorId &&
+        request.resource.data.paymentMethod == resource.data.paymentMethod &&
+        request.resource.data.receiptNumber == resource.data.receiptNumber &&
+        request.resource.data.invoiceNumber == resource.data.invoiceNumber;
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && hasValidUserRole() && hasValidUserStatus();
+      allow update: if (
+          isOwner(userId) &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.status == resource.data.status &&
+          hasValidUserRole() &&
+          hasValidUserStatus()
+        ) || (
+          isSupervisorProfileSubmission(userId) &&
+          hasValidUserRole() &&
+          hasValidUserStatus()
+        ) || (
+          isSupervisorResubmission(userId) &&
+          hasValidUserRole() &&
+          hasValidUserStatus()
+        ) || (
+          isProviderProfileSelfUpdate(userId) &&
+          hasValidUserRole() &&
+          hasValidUserStatus()
+        ) || (
+          isAdmin() && hasValidUserRole() && hasValidUserStatus()
+        );
+      allow delete: if isAdmin();
+
+      match /documents/{docId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create, update: if (isOwner(userId) || isAdmin()) && validProviderDocumentWrite(docId);
+        allow delete: if isOwner(userId) || isAdmin();
+      }
+    }
+
+    match /providers/{providerId} {
+      allow read: if isOwner(providerId) || isAdmin() || isSupervisor();
+      allow create, update: if (isOwner(providerId) && isProvider()) || isAdmin() || isSupervisor();
+      allow delete: if isAdmin();
+    }
+
+    match /provider_services/{serviceId} {
+      allow read: if isSignedIn();
+      allow create: if isAdmin() || (
+        isProvider() &&
+        request.resource.data.providerId == request.auth.uid
+      );
+      allow update, delete: if isAdmin() || isSupervisor() || (
+        isProvider() && requestProviderOwns(resource.data)
+      );
+    }
+
+    match /role_changes/{changeId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /categories/{categoryId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() || isSupervisor();
+
+      match /subcategories/{subId} {
+        allow read: if isSignedIn();
+        allow write: if isAdmin() || isSupervisor();
+      }
+    }
+
+    match /service_requests/{requestId} {
+      allow create: if isSignedIn() && request.resource.data.clientId == request.auth.uid;
+      allow read, update, delete: if isSignedIn() && (
+        resource.data.clientId == request.auth.uid ||
+        resource.data.providerId == request.auth.uid ||
+        isAdmin() ||
+        isSupervisor()
+      );
+    }
+
+    match /solicitudes/{solicitudId} {
+      allow create: if isSignedIn() && requestGeneratorOwns(request.resource.data);
+      allow read: if isSignedIn() && (
+        requestGeneratorOwns(resource.data) ||
+        requestVisibleToProvider(resource.data) ||
+        isAdmin() ||
+        isSupervisor()
+      );
+      allow update, delete: if isSignedIn() && (
+        requestGeneratorOwns(resource.data) ||
+        requestProviderOwns(resource.data) ||
+        isAdmin() ||
+        isSupervisor()
+      );
+    }
+
+    match /ofertas/{ofertaId} {
+      allow create: if isSignedIn() && requestProviderOwns(request.resource.data);
+      allow read, update, delete: if isSignedIn() && (
+        requestProviderOwns(resource.data) ||
+        (
+          resource.data.solicitudId is string &&
+          exists(/databases/$(database)/documents/solicitudes/$(resource.data.solicitudId)) &&
+          requestGeneratorOwns(
+            get(/databases/$(database)/documents/solicitudes/$(resource.data.solicitudId)).data
+          )
+        ) ||
+        isAdmin() ||
+        isSupervisor()
+      );
+    }
+
+    match /environmental_services/{serviceId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() || isSupervisor();
+    }
+
+    match /quotes/{quoteId} {
+      allow create: if isSignedIn() && (
+        request.resource.data.clientId == request.auth.uid ||
+        request.resource.data.providerId == request.auth.uid ||
+        isAdmin()
+      );
+      allow read, update, delete: if isSignedIn() && (
+        resource.data.clientId == request.auth.uid ||
+        resource.data.providerId == request.auth.uid ||
+        isAdmin()
+      );
+    }
+
+    match /payments/{paymentId} {
+      allow create: if isSignedIn() && (
+        request.resource.data.userId == request.auth.uid ||
+        request.resource.data.generadorId == request.auth.uid ||
+        request.resource.data.proveedorId == request.auth.uid ||
+        isAdmin()
+      );
+      allow read: if isSignedIn() && (
+        resource.data.userId == request.auth.uid ||
+        resource.data.generadorId == request.auth.uid ||
+        resource.data.proveedorId == request.auth.uid ||
+        isAdmin() ||
+        isSupervisor()
+      );
+      allow update: if (
+          isAdmin() || isSupervisor()
+        ) || (
+          isSignedIn() &&
+          (
+            resource.data.userId == request.auth.uid ||
+            resource.data.generadorId == request.auth.uid ||
+            resource.data.proveedorId == request.auth.uid
+          ) &&
+          immutablePaymentFields()
+        );
+      allow delete: if isAdmin();
+    }
+
+    match /payment_webhook_events/{eventId} {
+      allow read: if isAdmin() || isSupervisor();
+      allow write: if false;
+    }
+
+    match /notifications/{notifId} {
+      allow create: if isSignedIn() && (
+        request.resource.data.userId == request.auth.uid || isAdmin()
+      );
+      allow read, update, delete: if isSignedIn() && (
+        resource.data.userId == request.auth.uid || isAdmin()
+      );
+    }
+
+    match /metrics/{docId} {
+      allow read: if isSignedIn() && (isAdmin() || request.auth.token.auditor == true);
+      allow write: if isAdmin();
+    }
+
+    match /companies/{companyId}/docs/{docId} {
+      allow read, write: if isSignedIn() && companyId in request.auth.token.companyIds;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

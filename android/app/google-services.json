@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "626588374973",
+    "project_id": "saneapp-clean",
+    "storage_bucket": "saneapp-clean.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:626588374973:android:f6c8089f08c6629c6364d4",
+        "android_client_info": {
+          "package_name": "com.example.saneapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBt7mmvrddA67asE0Bm3wUrIxGcm2lXY3g"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

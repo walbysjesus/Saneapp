@@ -1,0 +1,85 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDocExists() {
+      return isSignedIn() &&
+        firestore.exists(/databases/(default)/documents/users/$(request.auth.uid));
+    }
+
+    function userRole() {
+      return userDocExists()
+        ? firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role
+        : null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.admin == true || userRole() == 'admin'
+      );
+    }
+
+    function isSupervisor() {
+      return isSignedIn() && (
+        request.auth.token.supervisor == true || userRole() == 'supervisor'
+      );
+    }
+
+    function isProvider() {
+      return isSignedIn() && (
+        request.auth.token.provider == true || userRole() == 'proveedor'
+      );
+    }
+
+    function isGenerator() {
+      return isSignedIn() && userRole() == 'generador';
+    }
+
+    function validDocumentUpload() {
+      return request.resource.size < 10 * 1024 * 1024 &&
+        request.resource.contentType.matches('application/pdf|image/.*');
+    }
+
+    function validImageUpload() {
+      return request.resource.size < 8 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+    }
+
+    match /provider_images/{userId}/{fileName} {
+      allow read: if isSignedIn();
+      allow write: if (isAdmin() || request.auth.uid == userId) && validImageUpload();
+    }
+
+    match /provider_docs/{userId}/{fileName} {
+      allow read: if isAdmin() || request.auth.uid == userId;
+      allow write: if (isAdmin() || request.auth.uid == userId) && validDocumentUpload();
+    }
+
+    match /proveedores/{userId}/{fileName} {
+      allow read: if isAdmin() || request.auth.uid == userId;
+      allow write: if (isAdmin() || request.auth.uid == userId) && validDocumentUpload();
+    }
+
+    match /request_images/{userId}/{fileName} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() || request.auth.uid == userId;
+    }
+
+    match /auction_images/{userId}/{fileName} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() || request.auth.uid == userId;
+    }
+
+    match /solicitudes/{solicitudId}/{allPaths=**} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() || isSupervisor();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

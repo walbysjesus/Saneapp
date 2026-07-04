@@ -1,0 +1,20 @@
+name: facebook_auth_desktop
+description: Local stub package to satisfy flutter_facebook_auth macOS default plugin resolution in non-macOS builds and tests.
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ^3.10.4
+  flutter: ">=3.27.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_facebook_auth_platform_interface: ^5.0.0
+
+flutter:
+  plugin:
+    implements: flutter_facebook_auth
+    platforms:
+      macos:
+        pluginClass: FacebookAuthDesktopPlugin
